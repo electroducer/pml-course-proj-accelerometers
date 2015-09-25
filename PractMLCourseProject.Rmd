@@ -1,0 +1,162 @@
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(cache = TRUE)
+```
+
+---
+title: "Predicting Exercise Correctness Using Accelerometer Data"
+subtitle: "Practical Machine Learning Course Project"
+author: "Jonas Robertson"
+output: html_document
+---
+
+
+## Summary
+
+The aim of this project was to attempt to predict the quality of a particular exercise in which a dumbbell was lifted by participants. Five different styles of lifting were performed, and data were collected from accelerometers attached to the belt, arm, forearm, and dumbbell of each participant. A total of 160 variables were supplied, with 19622 observations supplied in the training set. To perform a final evaluation of the prediction model, a set of 20 samples were supplied without the outcome class.
+After exploring and selecting appropriate features, a boosting method was chosen, and the best model was selected using cross-validation. This final model had a high accuracy and was used to successfully predict all 20 final test cases.
+
+
+
+## Data Sources
+
+The training data for this project were obtained from [this link](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv), and the final test data were obtained from [this link](https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv). The original dataset was collected and kindly made available by [the Human Activity Recognition Department at Groupware@LES](http://groupware.les.inf.puc-rio.br/har).
+
+
+## Data preprocessing
+
+The data were first imported from the two respective training and testing data files.
+
+```{r}
+training <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+```
+
+Running `str` on the training set indicated that there were `r dim(training)[1]` training observations and `r dim(training)[2]` variables. These variables included the name of each participant, various timestamps, window data, the outcome class, and variables for each accelerometer comprising raw data and various summaries of the data. A quick check of the `cvtd_timestamp` variable indicated that there were six distinct time series (all of which lasted about 3-4 minutes). Given that only `r length(levels(training$user_name))` users participated, it could be clearly shown that each time duration corresponded with a user.
+
+```{r}
+levels(training$cvtd_timestamp)
+unique(training$user_name[grep("^30", training$cvtd_timestamp)])
+```
+
+Thus, there were essentially `r length(levels(training$user_name))` distinct time series, with each possibly containing smaller time series chunks of samples. One option for the prediction algorithm then would be to only consider partitions of data chunks corresponding to the time series or users. However, considering that the final test set contained only single samples and a large number of variables were available for analysis, time and users were removed from the model.
+
+
+```{r warning = FALSE}
+
+# Remove user, time, and window vars
+dtrain <- training[-1:-7]
+
+# Temporarily separate the "classe" variable to make processing easier
+doutcome <- data.frame(classe = dtrain[,dim(dtrain)[2]])
+dtrain <- dtrain[,-dim(dtrain)[2]]
+
+# Convert all erroneous factors to numerics
+# This will result in an "NAs introduced by coercion" warning
+# However, this is okay, as the NAs are indeed NAs.
+asNum <- function(x) as.numeric(levels(x))[x]
+factToNum <- function(z) modifyList(z, lapply(z[, sapply(z, is.factor)], asNum))
+dtrain <- factToNum(dtrain)
+
+# Check to see how many variables have only one unique value, and remove them
+vars_with_one_val <- sapply(sapply(dtrain, unique), length) < 2
+dtrain <- dtrain[,!vars_with_one_val]
+
+# Print the names of removed variables
+names(vars_with_one_val)[vars_with_one_val]
+
+```
+
+As can be seen, the skewness and kurtosis values for yaw on the belt, dumbbell, and forearm were not present. However, these same values were present from the arm sensor.
+
+Many of the remaining `r dim(dtrain)[2]` variables had a considerable number of NAs and would be difficult to work with.
+
+```{r}
+# Determine the total number of NAs for each variable
+num_NAs <- sapply(lapply(dtrain, is.na), sum)
+
+sum(num_NAs < 19000)
+sum(num_NAs == 0)
+sum(num_NAs > 19000)
+```
+
+Interestingly, about 2/3 of the variables comprised nearly all NAs, while the remaining variables (1/3) had no NAs. Upon closer inspection, the variables with large numbers of NAs were all summary variables. While these variables may be still be useful in a classification algorithm, several problems would arise (e.g. defining the NA state, potential high correlation). Thus, variables with NAs were removed from the features.
+
+```{r}
+dtrain <- dtrain[, (sapply(lapply(dtrain, is.na), sum) == 0)]
+```
+
+Ultimately, `r dim(dtrain)[2]` variables were selected for prediction.
+
+No further preprocessing was performed on the data before training the initial model.
+
+
+## Data partitioning
+
+As the test samples included in this project were for final evaluation, they could not be used to compare or validate various models. Thus, the training set was divided into a 70%-30% training/validation partition scheme. Although 80%-20% could be considered a more standard approach, due to the abundance of data, the 70%-30% scheme was initially tested to see if acceptable accuracy could be obtained with slightly better efficiency.
+
+```{r}
+library(caret)
+set.seed(480)
+trainIndex <- createDataPartition(dtrain[,1], p = 0.7, list = FALSE)
+
+# Outcome classes were placed back in the data frame for convenience
+ttrain <- data.frame(dtrain[trainIndex,], classe = doutcome[trainIndex,])
+ttesting <- data.frame(dtrain[-trainIndex,], classe = doutcome[-trainIndex,])
+```
+
+
+## Model selection, comparison, and optimisation
+
+A number of prediction models were available for multiclass outcomes. In this project, a boosting approach was selected for its speed advantage over random forests and its relatively good performance. To train the model, the `train` function of the the `caret` library was used to call the `gbm` library. Initially, this was tested with the default parameters (i.e. resampling via bootstrapping, automatic outcome type detection), with good results. However, to ensure that the model selected was appropriate, and to use a slightly more appropriate resampling approach, the training funtion was set so as to run 15-fold cross-validation repeatedly (5 times).
+
+```{r message = FALSE}
+ctrl <- trainControl(method = "repeatedcv", number = 15, repeats = 5)
+boost_modcv <- train(x = ttrain[,1:dim(ttrain)[2]-1], y = ttrain$classe, method = "gbm", distribution = "multinomial", trControl = ctrl, verbose = FALSE)
+
+```
+
+
+## Model results
+
+Both of the training operations resulted in selecting a boosting model with `r boost_modcv$bestTune[1]` trees, an interaction depth of `r boost_modcv$bestTune[2]`, `r boost_modcv$bestTune[3]` shrinkage, and the number of objects in each node set to `r boost_modcv$bestTune[4]`. A plot of the importance of each variable used indicates that the majority of the variables had an influence on the results, while certain predictors had no influence on the results. In fact it is likely that many of the predictors could be excluded from the model without affecting accuracy.
+
+```{r fig.height = 8}
+varimp_modcv <- varImp(boost_modcv)
+
+# Number of variables with no influence on the outcome
+sum(varimp_modcv$importance == 0)
+
+plot(varimp_modcv)
+```
+
+## Error statistics
+
+The final in-sample error calculated for the best model was **`r boost_modcv$results[dim(boost_modcv$results)[1], 5]`**.
+
+The remaining 30% of the training samples that had been set aside as testing data were used to determine the out-of-sample error.
+
+```{r}
+tpred <- predict(boost_modcv, ttesting[,1:52])
+
+confmat <- confusionMatrix(tpred, ttesting$classe)
+
+qplot(x = classe, y = tpred, data = ttesting, geom = "jitter", alpha = I(0.4),
+      xlab = "Reference (actual value)", ylab = "Prediction")
+
+```
+
+As can be seen, the accuracy of the model was very high (**`r confmat$overall[1]`**), indicating a good fit.
+
+## Final prediction
+
+Ultimately, this project was successful in predicting the quality of the exercise performed in each of the 20 final test samples.
+
+```{r}
+predict(boost_modcv, testing)
+```
+
+
+
+## Limitations and future improvements.
+
+One potential issue that was not addressed in the training model was the fact that the samples were organised as time series. However, despite the model not taking the temporal relationships of the samples into consideration, relatively good performance was obtained. Nevertheless, a future model could be tuned by dividing cross-validation data into time series chunks, potentially resulting in even better performance.
